@@ -140,12 +140,33 @@ router.get("/files/:id/content", asyncRoute(async (req, res) => {
 
   const range = req.headers.range;
 
-  res.setHeader(
-    "Content-Type",
-    item.mimeType || "application/octet-stream"
-  );
+  const ext = (path.extname(item.name) || "").toLowerCase().replace(".", "");
+  const mimeMap = {
+    mp4: "video/mp4",
+    mkv: "video/webm",
+    webm: "video/webm",
+    mov: "video/mp4",
+    avi: "video/x-msvideo",
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    pdf: "application/pdf",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    gif: "image/gif",
+    webp: "image/webp",
+    svg: "image/svg+xml"
+  };
+  const resolvedMime = (item.mimeType && item.mimeType !== "application/octet-stream")
+    ? item.mimeType
+    : (mimeMap[ext] || item.mimeType || "application/octet-stream");
+
+  res.setHeader("Content-Type", resolvedMime);
   res.setHeader("Accept-Ranges", "bytes");
-  res.setHeader("X-Content-Type-Options", "nosniff");
+  if (!resolvedMime.startsWith("video/") && !resolvedMime.startsWith("audio/")) {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+  }
   res.setHeader("Cache-Control", "private, no-store");
   res.setHeader(
     "Content-Disposition",

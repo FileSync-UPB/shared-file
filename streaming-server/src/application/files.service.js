@@ -32,12 +32,12 @@ function roleRank(role) {
 }
 
 function getAccessRole(database, item, userId) {
-  if (!item || !userId) {
+  if (!item) {
     return null;
   }
 
   // El propietario conserva acceso a sus elementos.
-  if (item.ownerId === userId) {
+  if (userId && item.ownerId === userId) {
     return "owner";
   }
 
@@ -52,12 +52,12 @@ function getAccessRole(database, item, userId) {
 
     visited.add(current.id);
 
-    if (current.ownerId === userId) {
+    if (userId && current.ownerId === userId) {
       return "owner";
     }
 
     const permission = (current.permissions ?? []).find(
-      entry => entry.userId === userId
+      entry => (userId && entry.userId === userId) || entry.userId === "public"
     );
 
     if (permission) {

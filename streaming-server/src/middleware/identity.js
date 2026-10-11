@@ -1,14 +1,44 @@
-export function identityMiddleware(req, res, next) {
-  // Solo para pruebas locales. No autentica realmente al usuario.
-  if (process.env.NODE_ENV === "production") {
-    return res.status(503).json({
-      error: "Authentication integration is not configured"
-    });
+import mysql from "mysql2/promise";
+import crypto from "node:crypto";
+import { config } from "../config.js";
+
+const pool = mysql.createPool(config.db);
+
+export async function identityMiddleware(req, res, next) {
+  const authHeader = req.get("authorization");
+  let token = req.query.token;
+
+  if (!token) {
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      // Allow guest access for public shared links (content and metadata)
+      if (req.method === "GET" && req.path.match(/\/files\/[^/]+(\/content)?$/)) {
+        req.user = { id: null, role: 'guest', permissions: '[]' };
+        return next();
+      }
+      return res.status(401).json({ error: "Missing or invalid authorization header/token" });
+    }
+    token = authHeader.split(" ")[1];
   }
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
 
-  req.user = {
-    id: req.get("x-user-id")?.trim() || "demo-user"
-  };
+  try {
+    const [rows] = await pool.query(
+      "SELECT username, role_code, permissions_json FROM auth_tokens WHERE token_hash = ? AND active = 1 AND expires_at > NOW()",
+      [tokenHash]
+    );
 
-  next();
+    if (rows.length === 0) {
+      return res.status(401).json({ error: "Invalid or expired token" });
+    }
+
+    req.user = {
+      id: rows[0].username,
+      role: rows[0].role_code,
+      permissions: rows[0].permissions_json
+    };
+    next();
+  } catch (error) {
+    console.error("DB Auth error:", error);
+    res.status(500).json({ error: "Authentication failed due to server error" });
+  }
 }

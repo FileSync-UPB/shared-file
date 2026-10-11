@@ -12,5 +12,12 @@ export const config = {
   metadataPath: path.join(root, "data", "metadata.json"),
   storagePath: path.join(root, "storage", "objects"),
   tempPath: path.join(root, "temp"),
-  defaultQuotaBytes: 10 * 1024 * 1024 * 1024
+  defaultQuotaBytes: 1 * 1024 * 1024 * 1024,
+  db: {
+    host: process.env.MYSQL_HOST || "fylesync-mysql",
+    user: process.env.MYSQL_USER || "upb_app",
+    password: process.env.MYSQL_PASSWORD || "secret_password",
+    database: process.env.MYSQL_DATABASE || "fylesync_users",
+    port: Number(process.env.MYSQL_PORT || 3306)
+  }
 };
