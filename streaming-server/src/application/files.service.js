@@ -4,6 +4,7 @@ import {
   readDatabase,
   updateDatabase
 } from "../infrastructure/metadata.repository.js";
+import { deleteObject } from "../infrastructure/storage.local.js";
 import { createFile } from "../domain/file.js";
 import { config } from "../config.js";
 
@@ -21,6 +22,28 @@ export class DriveError extends Error {
 
 function getItemById(database, id) {
   return database.files.find(file => file.id === id) ?? null;
+}
+
+function getAllDescendantIds(database, folderId) {
+  const descendantIds = [];
+  const queue = [folderId];
+  const visited = new Set([folderId]);
+
+  while (queue.length > 0) {
+    const currentId = queue.shift();
+    const children = database.files.filter(file => file.parentId === currentId);
+    for (const child of children) {
+      if (!visited.has(child.id)) {
+        visited.add(child.id);
+        descendantIds.push(child.id);
+        if (child.kind === "folder") {
+          queue.push(child.id);
+        }
+      }
+    }
+  }
+
+  return descendantIds;
 }
 
 function roleRank(role) {
@@ -171,6 +194,10 @@ function usedBytes(database, userId) {
       file.kind === "file" &&
       !file.trashedAt
     ) {
+      // Ignorar huérfanos cuyo padre ya fue eliminado
+      if (file.parentId !== null && !database.files.some(f => f.id === file.parentId)) {
+        return total;
+      }
       return total + file.size;
     }
 
@@ -182,15 +209,20 @@ function getQuota(database, userId) {
   return database.quotas[userId] ?? config.defaultQuotaBytes;
 }
 
-function publicItem(item) {
+function publicItem(item, currentUserId = null) {
   const {
     storageKey,
     permissions,
+    starredBy,
     ...result
   } = item;
 
   // No exponer la ruta interna ni la lista interna de permisos.
-  return result;
+  return {
+    ...result,
+    isStarred: currentUserId && starredBy ? starredBy.includes(currentUserId) : false,
+    permissionsCount: (permissions ?? []).length
+  };
 }
 
 // --------------------------------------------------
@@ -208,7 +240,7 @@ export async function listItems(userId, parentId = null) {
         file.parentId === null &&
         !file.trashedAt
       )
-      .map(publicItem);
+      .map(file => publicItem(file, userId));
   }
 
   // Para abrir una carpeta compartida basta con leerla.
@@ -229,7 +261,7 @@ export async function listItems(userId, parentId = null) {
       !file.trashedAt &&
       getAccessRole(database, file, userId) !== null
     )
-    .map(publicItem);
+    .map(file => publicItem(file, userId));
 }
 
 export async function getItem(userId, id) {
@@ -448,6 +480,17 @@ export async function trashItem(userId, id) {
     item.trashedAt = now;
     item.updatedAt = now;
 
+    if (item.kind === "folder") {
+      const descendants = getAllDescendantIds(database, item.id);
+      for (const descId of descendants) {
+        const descItem = getItemById(database, descId);
+        if (descItem) {
+          descItem.trashedAt = now;
+          descItem.updatedAt = now;
+        }
+      }
+    }
+
     return {
       id: item.id,
       trashedAt: now
@@ -502,8 +545,20 @@ export async function restoreItem(userId, id) {
       item.id
     );
 
+    const now = new Date().toISOString();
     item.trashedAt = null;
-    item.updatedAt = new Date().toISOString();
+    item.updatedAt = now;
+
+    if (item.kind === "folder") {
+      const descendants = getAllDescendantIds(database, item.id);
+      for (const descId of descendants) {
+        const descItem = getItemById(database, descId);
+        if (descItem) {
+          descItem.trashedAt = null;
+          descItem.updatedAt = now;
+        }
+      }
+    }
 
     return publicItem(item);
   });
@@ -585,25 +640,38 @@ export async function shareItem(
       "owner"
     );
 
-    item.permissions ??= [];
+    const applyPerm = (target) => {
+      target.permissions ??= [];
+      const existing = target.permissions.find(
+        permission => permission.userId === recipient
+      );
 
-    const existing = item.permissions.find(
-      permission => permission.userId === recipient
-    );
+      if (existing) {
+        existing.role = role;
+        existing.updatedAt = new Date().toISOString();
+      } else {
+        target.permissions.push({
+          userId: recipient,
+          role,
+          grantedBy: ownerId,
+          createdAt: new Date().toISOString()
+        });
+      }
 
-    if (existing) {
-      existing.role = role;
-      existing.updatedAt = new Date().toISOString();
-    } else {
-      item.permissions.push({
-        userId: recipient,
-        role,
-        grantedBy: ownerId,
-        createdAt: new Date().toISOString()
-      });
+      target.updatedAt = new Date().toISOString();
+    };
+
+    applyPerm(item);
+
+    if (item.kind === "folder") {
+      const descendants = getAllDescendantIds(database, item.id);
+      for (const descId of descendants) {
+        const descItem = getItemById(database, descId);
+        if (descItem) {
+          applyPerm(descItem);
+        }
+      }
     }
-
-    item.updatedAt = new Date().toISOString();
 
     return {
       itemId: item.id,
@@ -648,17 +716,34 @@ export async function revokeItemAccess(
       "owner"
     );
 
-    const previousLength = (item.permissions ?? []).length;
+    const revokePerm = (target) => {
+      if (!target.permissions) return false;
+      const prevLen = target.permissions.length;
+      target.permissions = target.permissions.filter(
+        permission => permission.userId !== targetUserId
+      );
+      if (target.permissions.length !== prevLen) {
+        target.updatedAt = new Date().toISOString();
+        return true;
+      }
+      return false;
+    };
 
-    item.permissions = (item.permissions ?? []).filter(
-      permission => permission.userId !== targetUserId
-    );
+    const removedFromSelf = revokePerm(item);
 
-    if (item.permissions.length === previousLength) {
-      throw new DriveError(404, "Permission not found");
+    if (item.kind === "folder") {
+      const descendants = getAllDescendantIds(database, item.id);
+      for (const descId of descendants) {
+        const descItem = getItemById(database, descId);
+        if (descItem) {
+          revokePerm(descItem);
+        }
+      }
     }
 
-    item.updatedAt = new Date().toISOString();
+    if (!removedFromSelf) {
+      throw new DriveError(404, "Permission not found");
+    }
 
     return {
       itemId: item.id,
@@ -670,24 +755,118 @@ export async function revokeItemAccess(
 export async function listSharedWithMe(userId) {
   const database = await readDatabase();
 
-  // Devuelve las carpetas y archivos compartidos en la raíz
-  // de "Compartido conmigo". Los hijos se listan al abrir
-  // la carpeta con listItems(userId, folderId).
+  return database.files
+    .filter(item => {
+      if (item.trashedAt || item.ownerId === userId) return false;
+      const role = getAccessRole(database, item, userId);
+      if (!role) return false;
+
+      // Si el elemento pertenece a una carpeta padre que también es accesible por el usuario,
+      // no mostrarlo en la raíz para mantener la jerarquía de carpetas
+      if (item.parentId !== null) {
+        const parent = getItemById(database, item.parentId);
+        if (parent && !parent.trashedAt && getAccessRole(database, parent, userId) !== null) {
+          return false;
+        }
+      }
+
+      return true;
+    })
+    .map(item => ({
+      ...publicItem(item, userId),
+      ownerId: item.ownerId
+    }));
+}
+
+export async function listRecent(userId) {
+  const database = await readDatabase();
+
   return database.files
     .filter(item =>
       !item.trashedAt &&
-      item.ownerId !== userId &&
-      item.parentId === null &&
       getAccessRole(database, item, userId) !== null
     )
-    .map(item => ({
-      id: item.id,
-      name: item.name,
-      kind: item.kind,
-      ownerId: item.ownerId,
-      parentId: item.parentId,
-      mimeType: item.mimeType,
-      size: item.size,
-      updatedAt: item.updatedAt
-    }));
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt))
+    .slice(0, 50)
+    .map(item => publicItem(item, userId));
+}
+
+export async function toggleStar(userId, id) {
+  return updateDatabase(database => {
+    const item = getAccessibleItem(database, id, userId, "viewer");
+    if (!item.starredBy) {
+      item.starredBy = [];
+    }
+    const idx = item.starredBy.indexOf(userId);
+    let isStarred = false;
+    if (idx === -1) {
+      item.starredBy.push(userId);
+      isStarred = true;
+    } else {
+      item.starredBy.splice(idx, 1);
+      isStarred = false;
+    }
+    item.updatedAt = new Date().toISOString();
+    return { id: item.id, isStarred };
+  });
+}
+
+export async function listStarred(userId) {
+  const database = await readDatabase();
+
+  return database.files
+    .filter(item =>
+      !item.trashedAt &&
+      (item.starredBy ?? []).includes(userId) &&
+      getAccessRole(database, item, userId) !== null
+    )
+    .map(item => publicItem(item, userId));
+}
+
+export async function deletePermanently(userId, id) {
+  return updateDatabase(async database => {
+    const itemIndex = database.files.findIndex(file =>
+      file.id === id &&
+      file.ownerId === userId &&
+      file.trashedAt
+    );
+
+    if (itemIndex === -1) {
+      throw new DriveError(404, "Trashed item not found");
+    }
+
+    const [item] = database.files.splice(itemIndex, 1);
+
+    if (item.kind === "file" && item.storageKey) {
+      await deleteObject(item.storageKey).catch(() => {});
+    }
+
+    if (item.kind === "folder") {
+      const descendantIds = getAllDescendantIds(database, item.id);
+      for (const descId of descendantIds) {
+        const descIndex = database.files.findIndex(file => file.id === descId);
+        if (descIndex !== -1) {
+          const [descItem] = database.files.splice(descIndex, 1);
+          if (descItem.kind === "file" && descItem.storageKey) {
+            await deleteObject(descItem.storageKey).catch(() => {});
+          }
+        }
+      }
+    }
+
+    return { id, deleted: true };
+  });
+}
+
+export async function emptyTrash(userId) {
+  return updateDatabase(async database => {
+    const trashed = database.files.filter(f => f.ownerId === userId && f.trashedAt);
+    for (const item of trashed) {
+      if (item.kind === "file" && item.storageKey) {
+        await deleteObject(item.storageKey).catch(() => {});
+      }
+    }
+    database.files = database.files.filter(f => !(f.ownerId === userId && f.trashedAt));
+    return { clearedCount: trashed.length };
+  });
 }

@@ -10,8 +10,13 @@ export async function identityMiddleware(req, res, next) {
 
   if (!token) {
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      // Allow guest access for public shared links (content and metadata)
-      if (req.method === "GET" && req.path.match(/\/files\/[^/]+(\/content)?$/)) {
+      // Allow guest access for public shared links (content, metadata, and folder contents)
+      if (
+        req.method === "GET" && (
+          req.path.match(/\/files\/[^/]+(\/content)?$/) ||
+          ((req.path === "/" || req.path === "") && req.query.parentId)
+        )
+      ) {
         req.user = { id: null, role: 'guest', permissions: '[]' };
         return next();
       }

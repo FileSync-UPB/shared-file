@@ -19,7 +19,12 @@ import {
   shareItem,
   listItemPermissions,
   revokeItemAccess,
-  listSharedWithMe
+  listSharedWithMe,
+  listRecent,
+  toggleStar,
+  listStarred,
+  deletePermanently,
+  emptyTrash
 } from "../application/files.service.js";
 import {
   saveObject,
@@ -56,6 +61,26 @@ router.get("/usage", asyncRoute(async (req, res) => {
 
 router.get("/trash", asyncRoute(async (req, res) => {
   res.json({ items: await listTrash(req.user.id) });
+}));
+
+router.delete("/trash/empty", asyncRoute(async (req, res) => {
+  res.json(await emptyTrash(req.user.id));
+}));
+
+router.delete("/trash/:id/permanent", asyncRoute(async (req, res) => {
+  res.json(await deletePermanently(req.user.id, req.params.id));
+}));
+
+router.get("/recent", asyncRoute(async (req, res) => {
+  res.json({ items: await listRecent(req.user.id) });
+}));
+
+router.get("/starred", asyncRoute(async (req, res) => {
+  res.json({ items: await listStarred(req.user.id) });
+}));
+
+router.post("/:id/star", asyncRoute(async (req, res) => {
+  res.json(await toggleStar(req.user.id, req.params.id));
 }));
 
 router.post("/folders", asyncRoute(async (req, res) => {

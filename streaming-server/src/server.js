@@ -1,5 +1,6 @@
 import express from "express";
 import filesRouter from "./api/files.routes.js";
+import syncRouter from "./api/sync.routes.js";
 import { identityMiddleware } from "./middleware/identity.js";
 import { initializeStorage } from "./infrastructure/storage.local.js";
 import { config } from "./config.js";
@@ -30,6 +31,12 @@ app.use(
   "/api/files",
   identityMiddleware,
   filesRouter
+);
+
+app.use(
+  "/api/sync",
+  identityMiddleware,
+  syncRouter
 );
 
 app.use((error, req, res, next) => {
