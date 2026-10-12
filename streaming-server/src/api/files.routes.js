@@ -158,7 +158,7 @@ router.post("/trash/:id/restore", asyncRoute(async (req, res) => {
   res.json(await restoreItem(req.user.id, req.params.id));
 }));
 
-router.get("/files/:id/content", asyncRoute(async (req, res) => {
+router.get(["/files/:id/content", "/files/:id/content/:name"], asyncRoute(async (req, res) => {
   const item = await getContentRecord(req.user.id, req.params.id);
   const objectPath = getObjectPath(item.storageKey);
   const stat = await fs.stat(objectPath);
@@ -168,7 +168,7 @@ router.get("/files/:id/content", asyncRoute(async (req, res) => {
   const ext = (path.extname(item.name) || "").toLowerCase().replace(".", "");
   const mimeMap = {
     mp4: "video/mp4",
-    mkv: "video/webm",
+    mkv: "video/x-matroska",
     webm: "video/webm",
     mov: "video/mp4",
     avi: "video/x-msvideo",
