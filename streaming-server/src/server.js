@@ -1,6 +1,7 @@
 import express from "express";
 import filesRouter from "./api/files.routes.js";
 import syncRouter from "./api/sync.routes.js";
+import usersRouter from "./api/users.routes.js";
 import { identityMiddleware } from "./middleware/identity.js";
 import { initializeStorage } from "./infrastructure/storage.local.js";
 import { config } from "./config.js";
@@ -26,6 +27,8 @@ app.get("/api/health", (req, res) => {
     status: "UP"
   });
 });
+
+app.use("/api/users", usersRouter);
 
 app.use(
   "/api/files",
