@@ -2,6 +2,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "../config.js";
+import { readDatabase, updateDatabase } from "../infrastructure/metadata.repository.js";
+import { saveObject } from "../infrastructure/storage.local.js";
+import { createFile } from "../domain/file.js";
 
 const HOME_DIR = "/var/fylesync/home";
 const POLICIES_PATH = path.join(config.root, "data", "sync_policies.json");
@@ -29,9 +32,18 @@ async function readGoState() {
   }
 }
 
+async function writeGoState(data) {
+  try {
+    await fs.writeFile(path.join(HOME_DIR, "state.json"), JSON.stringify(data, null, 2), "utf8");
+  } catch (err) {
+    console.error("Error writing state.json:", err);
+  }
+}
+
 export async function getSyncOverview(userId) {
   const policies = await readPolicies();
   const goState = await readGoState();
+  const db = await readDatabase().catch(() => ({ files: [] }));
 
   // 1. Obtener dispositivos registrados en Go y enriquecer con configuración local
   const devicesMap = new Map();
@@ -66,46 +78,13 @@ export async function getSyncOverview(userId) {
     });
   }
 
-  // Si el usuario no tiene dispositivos creados aún, inicializar dos dispositivos de ejemplo (Escritorio y Móvil)
-  if (devicesMap.size === 0) {
-    const defaultDesktopId = `desktop-${userId}-win`;
-    const defaultMobileId = `mobile-${userId}-android`;
-
-    devicesMap.set(defaultDesktopId, {
-      id: defaultDesktopId,
-      name: `PC Escritorio ${userId} (Windows)`,
-      platform: "Windows",
-      syncFolder: `C:\\Users\\${userId}\\FyleSync`,
-      scheduleMode: "interval",
-      scheduleTime: "02:00",
-      intervalMinutes: 5,
-      wifiOnly: false,
-      lastSyncAt: new Date(Date.now() - 3600000).toISOString(),
-      status: "Sincronizado",
-      isRegisteredInGo: true
-    });
-
-    devicesMap.set(defaultMobileId, {
-      id: defaultMobileId,
-      name: `Dispositivo Móvil ${userId} (Android)`,
-      platform: "Android",
-      syncFolder: `/sdcard/Documents/FyleSync`,
-      scheduleMode: "scheduled",
-      scheduleTime: "02:00",
-      intervalMinutes: 15,
-      wifiOnly: true,
-      lastSyncAt: new Date(Date.now() - 7200000).toISOString(),
-      status: "En espera de Wi-Fi",
-      isRegisteredInGo: true
-    });
-  }
-
   policies.devices[userId] = Object.fromEntries(devicesMap);
   await writePolicies(policies);
 
   // 2. Escanear archivos en el repositorio espejado de este usuario (/var/fylesync/home/<userId>)
   const userHome = path.join(HOME_DIR, userId);
   const syncedFiles = [];
+  const foundFileNames = new Set();
 
   try {
     const entries = await fs.readdir(userHome, { withFileTypes: true, recursive: true });
@@ -114,6 +93,7 @@ export async function getSyncOverview(userId) {
         const fullPath = path.join(entry.parentPath || userHome, entry.name);
         const relPath = path.relative(userHome, fullPath).replace(/\\/g, "/");
         const stats = await fs.stat(fullPath);
+        foundFileNames.add(entry.name);
 
         // Buscar última revisión en Go
         const lastRev = (goState.Revisions || [])
@@ -121,19 +101,47 @@ export async function getSyncOverview(userId) {
           .reverse()
           .find(r => r.Path === relPath && r.Branch === "main");
 
+        // Buscar si existe en Drive metadata para obtener su ID de descarga/streaming
+        const driveItem = db.files.find(f => f.ownerId === userId && f.name === entry.name && !f.trashedAt);
+
         syncedFiles.push({
+          id: driveItem ? driveItem.id : null,
           path: relPath,
           name: entry.name,
           size: stats.size,
           lastModified: stats.mtime.toISOString(),
           revision: lastRev ? lastRev.ID : "r-central",
-          device: lastRev ? lastRev.Device : "servidor",
+          device: lastRev ? lastRev.Device : (driveItem ? "Dispositivo Móvil" : "servidor"),
           branch: lastRev ? lastRev.Branch : "main"
         });
       }
     }
   } catch {
     // Directorio de usuario vacío o aún sin inicializar
+  }
+
+  // También incluir archivos registrados en la carpeta "Dispositivos Sincronizados" de Drive
+  const syncRootFolder = db.files.find(f => f.ownerId === userId && f.kind === "folder" && f.name === "Dispositivos Sincronizados" && !f.trashedAt);
+  if (syncRootFolder) {
+    const deviceSubfolders = db.files.filter(f => f.parentId === syncRootFolder.id && f.kind === "folder" && !f.trashedAt);
+    const deviceSubfolderIds = new Set(deviceSubfolders.map(f => f.id));
+
+    const deviceFiles = db.files.filter(f => f.ownerId === userId && f.kind === "file" && deviceSubfolderIds.has(f.parentId) && !f.trashedAt);
+    for (const df of deviceFiles) {
+      if (!foundFileNames.has(df.name)) {
+        const parentFolder = deviceSubfolders.find(sf => sf.id === df.parentId);
+        syncedFiles.push({
+          id: df.id,
+          path: df.name,
+          name: df.name,
+          size: df.size,
+          lastModified: df.updatedAt,
+          revision: "r-sincronizado",
+          device: parentFolder ? parentFolder.name : "Dispositivo",
+          branch: "main"
+        });
+      }
+    }
   }
 
   // 3. Historial de eventos
@@ -173,6 +181,12 @@ export async function registerDevice(userId, data) {
   };
 
   policies.devices[userId][id] = device;
+
+  // Registrar también en Go state.json
+  const goState = await readGoState();
+  if (!goState.Devices) goState.Devices = {};
+  goState.Devices[id] = userId;
+  await writeGoState(goState);
 
   // Registrar evento en auditoría
   if (!policies.history) policies.history = [];
@@ -266,3 +280,138 @@ export async function triggerDeviceSync(userId, deviceId, options = {}) {
     lastSyncAt: device.lastSyncAt
   };
 }
+
+export async function uploadSyncedFile(userId, deviceId, uploadedFile, relativePath) {
+  await getSyncOverview(userId);
+  const policies = await readPolicies();
+  const device = policies.devices[userId]?.[deviceId];
+  const deviceName = device ? device.name : "Dispositivo";
+
+  const fileName = path.basename(relativePath || uploadedFile.originalname || "archivo");
+  const relPath = (relativePath || uploadedFile.originalname || fileName).replace(/\\/g, "/");
+
+  // 1. Guardar en /var/fylesync/home/<userId>/<relPath> (repositorio espejado)
+  const userHome = path.join(HOME_DIR, userId);
+  const destHomePath = path.join(userHome, relPath);
+  await fs.mkdir(path.dirname(destHomePath), { recursive: true });
+  await fs.copyFile(uploadedFile.path, destHomePath);
+
+  // 2. Guardar en storage/objects con storageKey (para streaming, album, visor y drive)
+  const storageKey = await saveObject(uploadedFile.path);
+
+  // 3. Registrar o actualizar en metadata.json bajo "Dispositivos Sincronizados / <deviceName>"
+  const registeredItem = await updateDatabase(database => {
+    // Buscar o crear carpeta raíz "Dispositivos Sincronizados"
+    let syncRoot = database.files.find(f => f.ownerId === userId && f.kind === "folder" && f.name === "Dispositivos Sincronizados" && f.parentId === null && !f.trashedAt);
+    if (!syncRoot) {
+      syncRoot = createFile({
+        id: crypto.randomUUID(),
+        ownerId: userId,
+        parentId: null,
+        name: "Dispositivos Sincronizados",
+        kind: "folder",
+        mimeType: "application/x-directory",
+        size: 0,
+        storageKey: null
+      });
+      database.files.push(syncRoot);
+    }
+
+    // Buscar o crear subcarpeta para el dispositivo
+    let deviceFolder = database.files.find(f => f.ownerId === userId && f.kind === "folder" && f.name === deviceName && f.parentId === syncRoot.id && !f.trashedAt);
+    if (!deviceFolder) {
+      deviceFolder = createFile({
+        id: crypto.randomUUID(),
+        ownerId: userId,
+        parentId: syncRoot.id,
+        name: deviceName,
+        kind: "folder",
+        mimeType: "application/x-directory",
+        size: 0,
+        storageKey: null
+      });
+      database.files.push(deviceFolder);
+    }
+
+    // Buscar si el archivo ya existe en esa carpeta
+    let fileItem = database.files.find(f => f.ownerId === userId && f.name === fileName && f.parentId === deviceFolder.id && !f.trashedAt);
+    if (fileItem) {
+      fileItem.storageKey = storageKey;
+      fileItem.size = uploadedFile.size;
+      fileItem.mimeType = uploadedFile.mimetype || "application/octet-stream";
+      fileItem.updatedAt = new Date().toISOString();
+    } else {
+      fileItem = createFile({
+        id: crypto.randomUUID(),
+        ownerId: userId,
+        parentId: deviceFolder.id,
+        name: fileName,
+        kind: "file",
+        mimeType: uploadedFile.mimetype || "application/octet-stream",
+        size: uploadedFile.size,
+        storageKey
+      });
+      database.files.push(fileItem);
+    }
+
+    return fileItem;
+  });
+
+  // 4. Actualizar estado y políticas
+  if (device) {
+    device.lastSyncAt = new Date().toISOString();
+    device.status = "Sincronizado";
+  }
+
+  if (!policies.history) policies.history = [];
+  policies.history.push({
+    id: crypto.randomUUID(),
+    userId,
+    deviceId,
+    platform: device ? device.platform : "Android",
+    action: "SINCRONIZACION_ARCHIVO",
+    detail: `Archivo "${fileName}" (${(uploadedFile.size / 1024).toFixed(1)} KB) sincronizado desde ${deviceName} al repositorio central y Mi Unidad.`,
+    timestamp: new Date().toISOString(),
+    status: "EXITO"
+  });
+
+  await writePolicies(policies);
+
+  return {
+    success: true,
+    file: fileName,
+    item: registeredItem,
+    message: `Archivo "${fileName}" sincronizado con éxito al repositorio central y Mi Unidad.`
+  };
+}
+
+export async function unregisterDevice(userId, deviceId) {
+  const policies = await readPolicies();
+  if (policies.devices[userId] && policies.devices[userId][deviceId]) {
+    const devName = policies.devices[userId][deviceId].name;
+    delete policies.devices[userId][deviceId];
+
+    // Eliminar también de Go state.json
+    const goState = await readGoState();
+    if (goState.Devices && goState.Devices[deviceId]) {
+      delete goState.Devices[deviceId];
+      await writeGoState(goState);
+    }
+
+    if (!policies.history) policies.history = [];
+    policies.history.push({
+      id: crypto.randomUUID(),
+      userId,
+      deviceId,
+      platform: "Sistema",
+      action: "DESVINCULACION_DISPOSITIVO",
+      detail: `Dispositivo "${devName}" desvinculado del sistema.`,
+      timestamp: new Date().toISOString(),
+      status: "EXITO"
+    });
+    await writePolicies(policies);
+    return { success: true, message: `Dispositivo "${devName}" desvinculado con éxito.` };
+  }
+  return { success: false, message: "Dispositivo no encontrado." };
+}
+
