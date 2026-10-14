@@ -778,6 +778,35 @@ export async function listSharedWithMe(userId) {
     }));
 }
 
+const IMAGE_EXT = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp"];
+const VIDEO_EXT = [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"];
+
+function fileCategory(item) {
+  const mime = (item.mimeType ?? "").toLowerCase();
+  const name = (item.name ?? "").toLowerCase();
+  if (mime.startsWith("image/") || IMAGE_EXT.some(e => name.endsWith(e))) return "images";
+  if (mime.startsWith("video/") || VIDEO_EXT.some(e => name.endsWith(e))) return "videos";
+  return "files";
+}
+
+export async function listByCategory(userId, category) {
+  if (!["images", "videos", "files"].includes(category)) {
+    throw new DriveError(400, "Invalid category");
+  }
+
+  const database = await readDatabase();
+
+  return database.files
+    .filter(item =>
+      item.kind === "file" &&
+      !item.trashedAt &&
+      getAccessRole(database, item, userId) !== null &&
+      fileCategory(item) === category
+    )
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt))
+    .map(item => publicItem(item, userId));
+}
+
 export async function listRecent(userId) {
   const database = await readDatabase();
 

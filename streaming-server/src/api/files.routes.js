@@ -24,7 +24,8 @@ import {
   toggleStar,
   listStarred,
   deletePermanently,
-  emptyTrash
+  emptyTrash,
+  listByCategory
 } from "../application/files.service.js";
 import {
   saveObject,
@@ -73,6 +74,10 @@ router.delete("/trash/:id/permanent", asyncRoute(async (req, res) => {
 
 router.get("/recent", asyncRoute(async (req, res) => {
   res.json({ items: await listRecent(req.user.id) });
+}));
+
+router.get("/category/:category", asyncRoute(async (req, res) => {
+  res.json({ items: await listByCategory(req.user.id, req.params.category) });
 }));
 
 router.get("/starred", asyncRoute(async (req, res) => {
